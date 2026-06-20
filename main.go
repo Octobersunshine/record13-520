@@ -5,22 +5,76 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/IBM/sarama"
 )
 
 type PartitionOffset struct {
-	Partition     int32  `json:"partition"`
-	CurrentOffset int64  `json:"current_offset"`
-	LatestOffset  int64  `json:"latest_offset"`
-	Lag           int64  `json:"lag"`
-	Metadata      string `json:"metadata,omitempty"`
+	Partition     int32   `json:"partition"`
+	CurrentOffset int64   `json:"current_offset"`
+	LatestOffset  int64   `json:"latest_offset"`
+	Lag           int64   `json:"lag"`
+	LagRate       float64 `json:"lag_rate"`
+	LagLevel      string  `json:"lag_level"`
+	Metadata      string  `json:"metadata,omitempty"`
 }
 
 type ConsumerGroupOffset struct {
 	GroupID    string            `json:"group_id"`
 	Partitions []PartitionOffset `json:"partitions"`
+}
+
+type lagThresholds struct {
+	AbsMinWarn int64
+	AbsMinCrit int64
+	PctWarn    float64
+	PctCrit    float64
+}
+
+func parseThresholds(r *http.Request) lagThresholds {
+	t := lagThresholds{
+		AbsMinWarn: 100,
+		AbsMinCrit: 1000,
+		PctWarn:    5.0,
+		PctCrit:    20.0,
+	}
+	if v := r.URL.Query().Get("abs_min_warn"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			t.AbsMinWarn = n
+		}
+	}
+	if v := r.URL.Query().Get("abs_min_crit"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			t.AbsMinCrit = n
+		}
+	}
+	if v := r.URL.Query().Get("pct_warn"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n >= 0 {
+			t.PctWarn = n
+		}
+	}
+	if v := r.URL.Query().Get("pct_crit"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n >= 0 {
+			t.PctCrit = n
+		}
+	}
+	return t
+}
+
+func classifyLag(lag int64, latestOffset int64, t lagThresholds) (float64, string) {
+	var lagRate float64
+	if latestOffset > 0 {
+		lagRate = float64(lag) / float64(latestOffset) * 100.0
+	}
+	if lag >= t.AbsMinCrit && lagRate >= t.PctCrit {
+		return lagRate, "critical"
+	}
+	if lag >= t.AbsMinWarn && lagRate >= t.PctWarn {
+		return lagRate, "warning"
+	}
+	return lagRate, "normal"
 }
 
 var (
@@ -49,6 +103,8 @@ func getOffsetsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "topic parameter is required", http.StatusBadRequest)
 		return
 	}
+
+	thresholds := parseThresholds(r)
 
 	config := sarama.NewConfig()
 	config.Version = sarama.V3_0_0_0
@@ -115,11 +171,14 @@ func getOffsetsHandler(w http.ResponseWriter, r *http.Request) {
 			if lag < 0 {
 				lag = 0
 			}
+			lagRate, lagLevel := classifyLag(lag, latest, thresholds)
 			groupPartitions = append(groupPartitions, PartitionOffset{
 				Partition:     partition,
 				CurrentOffset: block.Offset,
 				LatestOffset:  latest,
 				Lag:           lag,
+				LagRate:       lagRate,
+				LagLevel:      lagLevel,
 				Metadata:      block.Metadata,
 			})
 		}
